@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, Query, HTTPException
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
-URL = "https://pje1g.trf6.jus.br/consultapublica/ConsultaPublica/listView.seam/"
+URL = "https://pje-consulta-publica.tjmg.jus.br/"
 
 # CNJ: 0000000-00.0000.0.00.0000
 CNJ_RE = re.compile(r"\b\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}\b")
