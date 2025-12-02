@@ -66,40 +66,73 @@ async def find_input_any_frame(page):
                 pass
     return None, None
 
-async def set_doc_type_radio(page, frame, doc_type: str):
+async def force_set_doc_type_radio(page, frame, doc_type: str):
     """
-    Função CRUCIAL: Seleciona a bolinha (Radio Button) de CPF ou CNPJ.
+    Função BLINDADA: Tenta clicar e, se falhar, força via JavaScript.
     """
     target = doc_type.upper().strip() # CPF ou CNPJ
     
-    # Estratégias para achar o botão correto
-    strategies = [
-        # 1. Pelo Label exato (clique no texto)
+    # 1. Localizadores possíveis
+    locators = [
         frame.get_by_label(target, exact=True),
-        # 2. Pelo texto que contém a palavra (clique no texto)
-        frame.get_by_text(target, exact=True),
-        # 3. Input do tipo radio com valor ou nome próximo
         frame.locator(f"input[type='radio'][value='{target}']"),
-        # 4. XPath genérico procurando o input vizinho do texto
+        frame.locator(f"xpath=//label[contains(., '{target}')]/preceding-sibling::input[@type='radio']"),
         frame.locator(f"xpath=//label[contains(., '{target}')]//input[@type='radio']"),
-        frame.locator(f"xpath=//span[contains(., '{target}')]//preceding-sibling::input[@type='radio']")
+        frame.get_by_text(target, exact=True)
     ]
 
-    for locator in strategies:
+    selected = False
+    
+    for loc in locators:
         try:
-            if await locator.count() > 0 and await locator.first.is_visible():
-                # Tenta dar "check" se for input, ou "click" se for label
-                try:
-                    await locator.first.check(timeout=1000)
-                except:
-                    await locator.first.click(timeout=1000)
+            if await loc.count() > 0:
+                # Tenta check normal
+                if await loc.first.is_visible():
+                    await loc.first.check(force=True, timeout=1000)
+                    selected = True
+                else:
+                    # Se tiver escondido, tenta via JS
+                    await loc.first.evaluate("el => el.checked = true")
+                    await loc.first.evaluate("el => el.click()") # Dispara evento
+                    selected = True
                 
-                # Pequena pausa para o site processar a troca
-                await page.wait_for_timeout(500)
-                return True
+                if selected:
+                    break
         except:
             continue
-    return False
+            
+    # Fallback Javascript Puro (caso os seletores do Playwright falhem)
+    # Procura qualquer input radio que tenha o valor CNPJ ou esteja perto do texto CNPJ
+    if not selected:
+        try:
+            await frame.evaluate(f"""() => {{
+                const radios = Array.from(document.querySelectorAll('input[type="radio"]'));
+                for (const r of radios) {{
+                    // Tenta pelo valor
+                    if (r.value === '{target}') {{
+                        r.checked = true;
+                        r.click();
+                        return;
+                    }}
+                    // Tenta pelo label próximo
+                    if (r.nextSibling && r.nextSibling.textContent && r.nextSibling.textContent.includes('{target}')) {{
+                        r.checked = true;
+                        r.click();
+                        return;
+                    }}
+                    // Tenta pelo label pai
+                    if (r.parentElement && r.parentElement.textContent.includes('{target}')) {{
+                        r.checked = true;
+                        r.click();
+                        return;
+                    }}
+                }}
+            }}""")
+        except:
+            pass
+
+    await page.wait_for_timeout(500)
+    return True
 
 async def wait_spinner_or_delay(page):
     candidates = ".ui-widget-overlay, .ui-blockui, .ui-progressbar, [class*='loading' i], [class*='spinner' i]"
@@ -214,37 +247,46 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
+            # Importante: Args extras para evitar detecção e melhorar performance
+            args=[
+                "--no-sandbox", 
+                "--disable-setuid-sandbox", 
+                "--disable-blink-features=AutomationControlled",
+                "--ignore-certificate-errors"
+            ]
         )
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 720}
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            viewport={"width": 1366, "height": 768},
+            locale="pt-BR"
         )
         page = await context.new_page()
 
         try:
             await page.goto(URL, wait_until="domcontentloaded")
-            await page.wait_for_timeout(1500)
+            await page.wait_for_timeout(2000) # Espera inicial generosa
 
-            # 1. Encontra o frame (se houver) e o campo de input
+            # 1. Encontra o frame e o input
             fr, doc_input = await find_input_any_frame(page)
             if doc_input is None:
                 raise HTTPException(status_code=500, detail="nao_encontrei_campo_input")
 
-            # 2. SELECIONA O TIPO (CPF ou CNPJ) - Passo Novo Importante
-            # Se não conseguir clicar, seguimos tentando digitar (fallback), mas o ideal é clicar.
-            await set_doc_type_radio(page, fr, doc_type)
-
-            # 3. Preenche o documento
-            await doc_input.click(timeout=30000)
+            # 2. LIMPA E PREENCHE PRIMEIRO O DOCUMENTO (Estratégia Anti-Reset)
+            await doc_input.click(timeout=10000)
             await doc_input.fill("")
-            await doc_input.type(doc_digits, delay=50)
+            # Digita mais devagar para parecer humano
+            await doc_input.type(doc_digits, delay=100) 
+            
+            # 3. AGORA SIM, FORÇA A SELEÇÃO DO TIPO
+            await force_set_doc_type_radio(page, fr, doc_type)
 
+            # 4. Verifica se o texto ainda está lá (alguns sites limpam ao mudar o radio)
             typed = (await doc_input.input_value()).strip()
-            if not typed:
-                raise HTTPException(status_code=500, detail="falha_ao_digitar_documento")
+            if typed != doc_digits:
+                await doc_input.fill("")
+                await doc_input.type(doc_digits, delay=50)
 
-            # 4. Clica pesquisar
+            # 5. Clica pesquisar
             btn = fr.get_by_role("button", name="PESQUISAR")
             if await btn.count() == 0:
                 btn = page.get_by_role("button", name="PESQUISAR")
@@ -256,8 +298,16 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
 
             await wait_spinner_or_delay(page)
 
-            # 5. Lista processos
+            # 6. Lista processos
+            # Procura links que contenham o padrão CNJ
             proc_links = page.locator("a").filter(has_text=CNJ_RE)
+            
+            # Pequeno wait extra para garantir renderização da tabela
+            try:
+                await proc_links.first.wait_for(state="attached", timeout=4000)
+            except:
+                pass
+
             count = await proc_links.count()
 
             for i in range(count):
@@ -269,7 +319,8 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
 
                 popup = await open_process_popup(page, link)
                 if popup is None:
-                    icon = link.locator("xpath=ancestor::*[self::tr or self::div][1]//a[1]")
+                    # Tenta ícone da lupa/pasta se houver
+                    icon = link.locator("xpath=ancestor::*[self::tr or self::div][1]//a[contains(@title, 'Visualizar') or contains(@class, 'visualizar')]")
                     if await icon.count() > 0:
                         popup = await open_process_popup(page, icon.first)
 
@@ -277,7 +328,7 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
                     result["processos"].append({"numero": numero, "erro": "nao_abriu_popup"})
                     continue
 
-                await popup.wait_for_timeout(1200)
+                await popup.wait_for_timeout(1500)
                 meta = await extract_metadata(popup)
                 movs = await extract_movements(popup)
 
@@ -286,7 +337,8 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
 
         except Exception as e:
             await browser.close()
-            raise HTTPException(status_code=500, detail=str(e))
+            # Retorna o erro detalhado para ajudar no debug
+            raise HTTPException(status_code=500, detail=f"Erro no scraping: {str(e)}")
 
         await browser.close()
 
@@ -310,34 +362,4 @@ async def consulta(
     if tipo:
         doc_type = tipo.upper().strip()
     else:
-        # Se não enviou tipo, detecta pelo tamanho
-        if len(doc_digits) == 14:
-            doc_type = "CNPJ"
-        elif len(doc_digits) == 11:
-            doc_type = "CPF"
-    
-    # Validação de tamanho baseada no tipo detectado
-    if doc_type == "CPF" and len(doc_digits) != 11:
-        raise HTTPException(status_code=400, detail="cpf_invalido_deve_ter_11_digitos")
-    if doc_type == "CNPJ" and len(doc_digits) != 14:
-        raise HTTPException(status_code=400, detail="cnpj_invalido_deve_ter_14_digitos")
-
-    # Cache
-    cache_key = f"{doc_digits}_{doc_type}"
-    now = time.time()
-    cached = _cache.get(cache_key)
-    if cached and (now - cached["ts"]) < CACHE_TTL:
-        return cached["data"]
-
-    async with SEMA:
-        cached = _cache.get(cache_key)
-        if cached and (time.time() - cached["ts"]) < CACHE_TTL:
-            return cached["data"]
-
-        try:
-            # Passamos o doc_type para o scraper saber qual botão clicar
-            data = await asyncio.wait_for(scrape_pje(doc_digits, doc_type), timeout=180)
-            _cache[cache_key] = {"ts": time.time(), "data": data}
-            return data
-        except asyncio.TimeoutError:
-            raise HTTPException(status_code=504, detail="timeout_tjmg_demorou_muito")
+        if len(doc_digits)
