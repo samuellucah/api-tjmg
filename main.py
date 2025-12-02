@@ -113,7 +113,6 @@ async def ensure_input_match(page, input_locator, expected_digits: str):
             pass
 
     # TENTATIVA FINAL: INJEÇÃO DIRETA VIA JAVASCRIPT
-    # Isso passa por cima de qualquer bloqueio visual/máscara do site
     print("Digitação falhou. Forçando valor via JS...")
     try:
         await input_locator.evaluate(f"""(el) => {{
@@ -216,19 +215,22 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
             await page.goto(URL, wait_until="domcontentloaded", timeout=45000)
             await page.wait_for_timeout(2000)
 
+            # 1. Busca Frame (IMPORTANTE: Guardamos o frame 'fr' para usar depois)
             fr, doc_input = await find_input_any_frame(page)
             if not doc_input:
                 raise Exception("Input de CPF/CNPJ não encontrado.")
 
-            # 1. Troca o Radio Button
+            # 2. Troca o Radio Button
             await force_set_doc_type_radio(page, fr, doc_type)
             await page.wait_for_timeout(1500)
+            
+            # Recarrega input (o DOM pode ter mudado)
             fr, doc_input = await find_input_any_frame(page)
             
-            # 2. Digita (com injeção JS se necessário)
+            # 3. Digita (com injeção JS se necessário)
             match = await ensure_input_match(page, doc_input, doc_digits)
             
-            # 3. Se falhou, tenta a estratégia de Toggle (último recurso)
+            # Toggle se falhar
             if not match:
                 print("Injeção falhou. Tentando Toggle...")
                 other_type = "CPF" if doc_type == "CNPJ" else "CNPJ"
@@ -241,8 +243,7 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
                 match = await ensure_input_match(page, doc_input, doc_digits)
 
             if not match:
-                # Retorna aviso mas não quebra tudo
-                result["aviso_site"] = f"Não foi possível digitar o documento completo ({len(doc_digits)} dígitos). O site pode estar travado."
+                result["aviso_site"] = f"Não foi possível digitar o documento completo ({len(doc_digits)} dígitos)."
             
             # 4. Pesquisar
             btn = fr.locator("button:has-text('PESQUISAR'), input[type='submit'][value*='PESQUISAR' i]").first
@@ -260,15 +261,22 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
             except:
                 await page.wait_for_timeout(4000)
 
-            # 5. Captura Resultados
-            links = page.locator("a").filter(has_text=CNJ_RE)
+            # 5. Captura Resultados (CORREÇÃO IFRAME)
+            # Usamos 'fr' (o frame onde estava o input) para buscar os resultados.
+            # Se 'fr' for None (improvável se achamos input), usamos 'page'.
+            search_scope = fr if fr else page
+            
+            links = search_scope.locator("a").filter(has_text=CNJ_RE)
             if await links.count() == 0:
-                links = page.locator("tr").filter(has_text=CNJ_RE)
+                links = search_scope.locator("tr").filter(has_text=CNJ_RE)
 
             count = await links.count()
             
             if count == 0:
-                msg = await page.locator(".ui-messages-error").all_inner_texts()
+                # Procura aviso no frame e na página
+                msg = await search_scope.locator(".ui-messages-error").all_inner_texts()
+                if not msg:
+                    msg = await page.locator(".ui-messages-error").all_inner_texts()
                 if msg: result["aviso_site"] = msg
 
             seen = set()
