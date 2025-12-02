@@ -87,9 +87,9 @@ async def force_set_doc_type_radio(page, frame, doc_type: str) -> bool:
 
 async def ensure_input_match(page, input_locator, expected_digits: str):
     """
-    GARANTIA DE PREENCHIMENTO (COM FORÇA BRUTA JS):
+    GARANTIA DE PREENCHIMENTO:
     1. Tenta digitar normalmente.
-    2. Se falhar, INJETA o valor via JavaScript (ignora a máscara).
+    2. Se falhar, INJETA o valor via JavaScript.
     """
     for attempt in range(2):
         try:
@@ -111,7 +111,7 @@ async def ensure_input_match(page, input_locator, expected_digits: str):
         except:
             pass
 
-    print("Digitação falhou. Forçando valor via JS...")
+    print(f"Digitação falhou (Lido: {clean_val} vs Esperado: {expected_digits}). Forçando JS...")
     try:
         await input_locator.evaluate(f"""(el) => {{
             el.value = '{expected_digits}';
@@ -189,28 +189,37 @@ async def extract_movements(popup) -> List[str]:
             continue
     return texts[:10]
 
-# --- NOVA FUNÇÃO INTELIGENTE DE BUSCA DE RESULTADOS ---
-async def find_results_frame_and_links(page):
+# --- BUSCA INTELIGENTE DE RESULTADOS ---
+async def wait_and_find_results(page):
     """
-    Escaneia a página principal e TODOS os frames procurando onde estão os resultados (CNJ).
-    Retorna (frame_encontrado, locator_dos_links).
+    Aguarda explicitamente por sinais de sucesso ou falha na pesquisa em TODOS os frames.
     """
-    frames = [page.main_frame] + page.frames
+    start_time = time.time()
+    while (time.time() - start_time) < 30: # Espera até 30 segundos
+        frames = [page.main_frame] + page.frames
+        for fr in frames:
+            try:
+                # 1. Sucesso: Links de Processo
+                links = fr.locator("a").filter(has_text=CNJ_RE)
+                if await links.count() > 0:
+                    return fr, links
+                
+                # 2. Sucesso: Tabela de Resultados (fallback)
+                rows = fr.locator("tr").filter(has_text=CNJ_RE)
+                if await rows.count() > 0:
+                    return fr, rows
+                
+                # 3. Aviso: Mensagem de erro ou "Nenhum registro"
+                msg_el = fr.locator(".ui-messages-error, .ui-messages-info, .ui-messages-warn")
+                if await msg_el.count() > 0:
+                    txt = await msg_el.first.inner_text()
+                    if "encontrado" in txt.lower() or "registro" in txt.lower():
+                        return fr, None # Encontrou aviso de que não tem nada
+            except:
+                continue
+        
+        await page.wait_for_timeout(1000)
     
-    for fr in frames:
-        try:
-            # Procura links <a> com CNJ
-            links = fr.locator("a").filter(has_text=CNJ_RE)
-            if await links.count() > 0:
-                return fr, links
-            
-            # Fallback: Procura linhas <tr> com CNJ (caso não seja link direto)
-            rows = fr.locator("tr").filter(has_text=CNJ_RE)
-            if await rows.count() > 0:
-                return fr, rows
-        except:
-            continue
-            
     return None, None
 
 async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
@@ -233,7 +242,7 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
         
         try:
             page = await context.new_page()
-            await page.goto(URL, wait_until="domcontentloaded", timeout=45000)
+            await page.goto(URL, wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_timeout(2000)
 
             fr, doc_input = await find_input_any_frame(page)
@@ -241,12 +250,14 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
                 raise Exception("Input de CPF/CNPJ não encontrado.")
 
             # 1. Troca o Radio Button
+            print(f"Selecionando tipo {doc_type}...")
             await force_set_doc_type_radio(page, fr, doc_type)
             await page.wait_for_timeout(1500)
             
             fr, doc_input = await find_input_any_frame(page)
             
-            # 2. Digita (com injeção JS se necessário)
+            # 2. Digita
+            print(f"Digitando documento {doc_digits}...")
             match = await ensure_input_match(page, doc_input, doc_digits)
             
             if not match:
@@ -264,6 +275,7 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
                 result["aviso_site"] = f"Não foi possível digitar o documento completo ({len(doc_digits)} dígitos)."
             
             # 3. Pesquisar
+            print("Clicando em Pesquisar...")
             btn = fr.locator("button:has-text('PESQUISAR'), input[type='submit'][value*='PESQUISAR' i]").first
             if await btn.count() == 0:
                 btn = page.locator("button:has-text('PESQUISAR')").first
@@ -273,34 +285,26 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
             else:
                 await doc_input.press("Enter")
             
-            try:
-                await page.locator(".ui-progressbar").wait_for(state="visible", timeout=2000)
-                await page.locator(".ui-progressbar").wait_for(state="hidden", timeout=25000)
-            except:
-                await page.wait_for_timeout(4000)
-
-            # 4. Captura Resultados (CORREÇÃO FINAL)
-            # Em vez de confiar no frame antigo, ESCANEIAMOS tudo de novo.
-            res_frame, links = await find_results_frame_and_links(page)
+            # 4. Aguarda e Captura Resultados
+            print("Aguardando resultados...")
+            res_frame, links = await wait_and_find_results(page)
             
             if not links or await links.count() == 0:
-                # Se não achou links, procura mensagem de erro globalmente
-                msg = await page.locator(".ui-messages-error").all_inner_texts()
-                # E também dentro dos frames
-                if not msg:
-                    for f in page.frames:
-                        try:
-                            m = await f.locator(".ui-messages-error").all_inner_texts()
-                            if m: 
-                                msg = m
-                                break
-                        except: pass
-                if msg: result["aviso_site"] = msg
+                # Procura aviso final
+                msg = await page.locator(".ui-messages-error, .ui-messages-info").all_inner_texts()
+                if not msg and res_frame:
+                    msg = await res_frame.locator(".ui-messages-error, .ui-messages-info").all_inner_texts()
                 
-                # Encerra se não achou nada
+                if msg: 
+                    result["aviso_site"] = msg
+                    print(f"Aviso do site encontrado: {msg}")
+                else:
+                    print("Timeout: Nenhum resultado ou aviso encontrado.")
+                
                 return result
 
             count = await links.count()
+            print(f"Encontrados {count} processos.")
             seen = set()
             
             for i in range(count):
@@ -332,6 +336,7 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
                         result["processos"].append({"numero": numero, "erro": "popup_bloqueado"})
 
         except Exception as e:
+            print(f"ERRO GERAL: {e}")
             result["erro_interno"] = str(e)
         finally:
             await browser.close()
