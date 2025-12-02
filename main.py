@@ -14,7 +14,6 @@ URL = "https://pje-consulta-publica.tjmg.jus.br/"
 # Regex CNJ
 CNJ_RE = re.compile(r"\b\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}\b")
 
-# Filtro de ruídos
 UNWANTED_RE = re.compile(
     r"(documentos?\s+juntados|documento\b|certid[aã]o|visualizar|"
     r"pjeoffice|indispon[ií]vel|aplicativo\s+pjeoffice|"
@@ -32,45 +31,21 @@ SEMA = asyncio.Semaphore(1)
 CACHE_TTL = 300
 _cache: Dict[str, Dict[str, Any]] = {}
 
-app = FastAPI(title="PJe TJMG - Consulta Pública (Final Fix)")
+app = FastAPI(title="PJe TJMG - Consulta Pública (Frame Scan)")
 
 # ==============================================================================
-# FUNÇÕES DE NAVEGAÇÃO
+# FUNÇÕES DE APOIO
 # ==============================================================================
-
-async def find_input_any_frame(page):
-    """Procura o input de documento e retorna também o FRAME onde ele está."""
-    frames = [page.main_frame] + [f for f in page.frames if f != page.main_frame]
-    
-    for fr in frames:
-        try:
-            inputs = fr.locator("input[type='text']:visible, input[type='tel']:visible")
-            count = await inputs.count()
-            
-            for i in range(count):
-                inp = inputs.nth(i)
-                id_attr = (await inp.get_attribute("id") or "").lower()
-                placeholder = (await inp.get_attribute("placeholder") or "").lower()
-                
-                # Lista negra: ignora campos que NÃO são de documento
-                blacklist = ["nome", "processo", "advogado", "oab", "classe", "vara"]
-                if any(bad in id_attr for bad in blacklist) or any(bad in placeholder for bad in blacklist):
-                    continue
-                
-                return fr, inp
-        except:
-            continue
-    return None, None
 
 async def wait_loading(page: Page):
-    """Espera carregamentos do PJe."""
+    """Aguarda carregamento visual do PJe."""
     try:
-        await page.wait_for_timeout(500)
+        await page.wait_for_timeout(800)
         blockers = [".ui-widget-overlay", ".ui-blockui", "[class*='loading' i]", "[class*='spinner' i]"]
         for sel in blockers:
             if await page.locator(sel).count() > 0:
                 if await page.locator(sel).first.is_visible():
-                    try: await page.locator(sel).first.wait_for(state="hidden", timeout=5000)
+                    try: await page.locator(sel).first.wait_for(state="hidden", timeout=8000)
                     except: pass
     except: pass
 
@@ -89,6 +64,7 @@ async def open_process_popup(page: Page, clickable):
         return None
 
 async def extract_data(popup: Page, numero: str) -> Dict[str, Any]:
+    # Tenta aba movimentações
     try:
         tab = popup.locator("text=/Movimenta(ç|c)ões/i").first
         if await tab.is_visible():
@@ -96,6 +72,7 @@ async def extract_data(popup: Page, numero: str) -> Dict[str, Any]:
             await popup.wait_for_timeout(500)
     except: pass
 
+    # Metadados
     meta = {"assunto": None, "classe_judicial": None, "data_distribuicao": None, "orgao_julgador": None, "jurisdicao": None}
     try:
         body = await popup.locator("body").inner_text()
@@ -122,6 +99,7 @@ async def extract_data(popup: Page, numero: str) -> Dict[str, Any]:
                             break
     except: pass
 
+    # Movimentações
     movs = []
     seen = set()
     selectors = ["tbody[id*='moviment'] tr", "table[class*='moviment'] tr", ".rich-table-row"]
@@ -167,99 +145,134 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
             await wait_loading(page)
 
             # === 1. SELEÇÃO DO TIPO ===
-            # Clica no radio e espera o site reagir
+            # Clica e espera a máscara mudar
             try:
                 if doc_type.upper() == "CNPJ":
                     await page.locator("input[type='radio'][value='CNPJ'], label:has-text('CNPJ')").first.click()
                 else:
                     await page.locator("input[type='radio'][value='CPF'], label:has-text('CPF')").first.click()
-                await page.wait_for_timeout(1000)
+                await page.wait_for_timeout(1500) 
             except: 
-                print("Erro ao clicar no radio (pode já estar selecionado)")
+                print("Erro ao clicar radio")
 
-            # === 2. LOCALIZAR O INPUT E O FRAME CORRETO ===
-            fr, target_input = await find_input_any_frame(page)
+            # === 2. LOCALIZAR O INPUT CERTO (Varredura de Frames) ===
+            target_input = None
+            target_frame = None
+            
+            # Pega lista de todos os frames (principal + iframes)
+            frames = [page.main_frame] + page.frames
+            
+            for fr in frames:
+                # Procura inputs visíveis neste frame
+                inputs = fr.locator("input[type='text']:visible")
+                count = await inputs.count()
+                
+                for i in range(count):
+                    inp = inputs.nth(i)
+                    id_attr = (await inp.get_attribute("id") or "").lower()
+                    
+                    # Filtra inputs errados
+                    blacklist = ["nome", "processo", "advogado", "oab", "classe", "vara"]
+                    if any(b in id_attr for b in blacklist):
+                        continue
+                        
+                    # Se achou um input que não é os de cima, assume que é o Doc
+                    target_input = inp
+                    target_frame = fr
+                    break
+                if target_input: break
 
             if not target_input:
-                # Fallback: tenta buscar diretamente pelo label
-                target_input = page.locator("td:has-text('CPF'), td:has-text('CNPJ')").locator("xpath=..//input").first
-                fr = page
+                raise HTTPException(status_code=500, detail="input_nao_encontrado_na_tela")
 
-            if not target_input:
-                raise HTTPException(status_code=500, detail="input_nao_encontrado")
-
-            # === 3. PREENCHER ===
+            # === 3. PREENCHER E PESQUISAR ===
             await target_input.click()
             await target_input.fill("")
             await target_input.type(doc_digits, delay=50)
             
-            # === 4. CLICAR NO BOTÃO ===
-            search_context = fr if fr else page
-            btn_selectors = [
-                "input[value='PESQUISAR']", 
-                "button:has-text('PESQUISAR')", 
-                "a:has-text('PESQUISAR')",
-                "input[type='submit']"
-            ]
-            
+            # Clica PESQUISAR (no mesmo frame do input)
             btn = None
+            btn_selectors = ["input[value='PESQUISAR']", "button:has-text('PESQUISAR')", "input[type='submit']"]
             for sel in btn_selectors:
-                possible_btn = search_context.locator(sel).first
-                if await possible_btn.is_visible():
-                    btn = possible_btn
+                if await target_frame.locator(sel).count() > 0:
+                    btn = target_frame.locator(sel).first
                     break
             
-            if not btn:
-                btn = page.get_by_role("button", name="PESQUISAR").first
-            
-            await btn.click()
+            if btn:
+                await btn.click()
+            else:
+                # Fallback: Tenta na página inteira
+                await page.locator("input[value='PESQUISAR']").click()
             
             await wait_loading(page)
             
-            # Espera tabela ou erro
+            # Espera tabela carregar
             try:
-                await page.wait_for_selector("a.btn-detalhes, a[href*='Processo'], .rich-messages", timeout=8000)
+                await page.wait_for_selector("a.btn-detalhes, a[href*='Processo'], .rich-messages, .rich-table", timeout=8000)
             except: pass
 
-            # === 5. EXTRAIR DADOS ===
-            links = page.locator("a").filter(has_text=CNJ_RE)
-            count = await links.count()
-            print(f"Links encontrados: {count}")
-
-            for i in range(count):
-                link = links.nth(i)
-                if not await link.is_visible(): continue
-                
-                txt = _norm(await link.inner_text())
-                m = CNJ_RE.search(txt)
-                if not m: continue
-                
-                numero = m.group(0)
-                
-                clickable = link
+            # === 4. EXTRAIR RESULTADOS (VARREDURA GLOBAL) ===
+            # Aqui estava o erro: Os resultados podem estar em um frame diferente.
+            # Vamos procurar links CNJ em TODOS os frames.
+            
+            total_links = []
+            
+            # Recarrega a lista de frames pois pode ter mudado após a pesquisa
+            all_frames = [page.main_frame] + page.frames
+            
+            for fr in all_frames:
                 try:
-                    row = link.locator("xpath=./ancestor::tr").first
-                    icon = row.locator("a[title*='Abrir'], a[title*='Detalhes']").first
-                    if await icon.count() > 0: clickable = icon
-                except: pass
+                    # Procura links neste frame
+                    links = fr.locator("a").filter(has_text=CNJ_RE)
+                    count = await links.count()
+                    if count > 0:
+                        print(f"Encontrados {count} links no frame {fr.name}")
+                        for i in range(count):
+                            total_links.append(links.nth(i))
+                except: continue
 
-                popup = await open_process_popup(page, clickable)
-                
-                if popup is None:
-                    result["processos"].append({"numero": numero, "erro": "popup_bloqueado", "movimentacoes": []})
-                    continue
+            print(f"Total de links processáveis: {len(total_links)}")
 
-                await popup.wait_for_timeout(1000)
-                meta_data = await extract_data(popup, numero)
-                result["processos"].append(meta_data)
-                await popup.close()
+            processed_numbers = set()
+
+            for link in total_links:
+                try:
+                    if not await link.is_visible(): continue
+                    
+                    txt = _norm(await link.inner_text())
+                    m = CNJ_RE.search(txt)
+                    if not m: continue
+                    
+                    numero = m.group(0)
+                    if numero in processed_numbers: continue
+                    processed_numbers.add(numero)
+                    
+                    # Tenta achar ícone de popup (dentro do mesmo frame do link)
+                    clickable = link
+                    try:
+                        row = link.locator("xpath=./ancestor::tr").first
+                        icon = row.locator("a[title*='Abrir'], a[title*='Detalhes']").first
+                        if await icon.count() > 0: clickable = icon
+                    except: pass
+
+                    popup = await open_process_popup(page, clickable)
+                    
+                    if popup is None:
+                        result["processos"].append({"numero": numero, "erro": "popup_bloqueado", "movimentacoes": []})
+                        continue
+
+                    await popup.wait_for_timeout(1000)
+                    meta_data = await extract_data(popup, numero)
+                    result["processos"].append(meta_data)
+                    await popup.close()
+                except: continue
 
         except Exception as e:
             print(f"Erro geral: {e}")
-            await browser.close() # <--- CORRIGIDO AQUI
+            await browser.close()
             raise HTTPException(status_code=500, detail=str(e))
 
-        await browser.close() # <--- CORRIGIDO AQUI TAMBÉM
+        await browser.close()
     return result
 
 @app.get("/health")
