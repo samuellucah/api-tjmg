@@ -32,7 +32,7 @@ SEMA = asyncio.Semaphore(1)
 CACHE_TTL = 300
 _cache: Dict[str, Dict[str, Any]] = {}
 
-app = FastAPI(title="PJe TJMG - Consulta Pública (Iframe Fix)")
+app = FastAPI(title="PJe TJMG - Consulta Pública (Final Fix)")
 
 # ==============================================================================
 # FUNÇÕES DE NAVEGAÇÃO
@@ -44,7 +44,6 @@ async def find_input_any_frame(page):
     
     for fr in frames:
         try:
-            # Procura inputs visíveis
             inputs = fr.locator("input[type='text']:visible, input[type='tel']:visible")
             count = await inputs.count()
             
@@ -53,12 +52,11 @@ async def find_input_any_frame(page):
                 id_attr = (await inp.get_attribute("id") or "").lower()
                 placeholder = (await inp.get_attribute("placeholder") or "").lower()
                 
-                # Blacklist: ignora campos de nome, oab, processo
+                # Lista negra: ignora campos que NÃO são de documento
                 blacklist = ["nome", "processo", "advogado", "oab", "classe", "vara"]
                 if any(bad in id_attr for bad in blacklist) or any(bad in placeholder for bad in blacklist):
                     continue
                 
-                # Achou um input limpo? Retorna o Frame e o Elemento
                 return fr, inp
         except:
             continue
@@ -91,7 +89,6 @@ async def open_process_popup(page: Page, clickable):
         return None
 
 async def extract_data(popup: Page, numero: str) -> Dict[str, Any]:
-    # Tenta ir para aba de movimentações
     try:
         tab = popup.locator("text=/Movimenta(ç|c)ões/i").first
         if await tab.is_visible():
@@ -99,7 +96,6 @@ async def extract_data(popup: Page, numero: str) -> Dict[str, Any]:
             await popup.wait_for_timeout(500)
     except: pass
 
-    # Metadados
     meta = {"assunto": None, "classe_judicial": None, "data_distribuicao": None, "orgao_julgador": None, "jurisdicao": None}
     try:
         body = await popup.locator("body").inner_text()
@@ -126,7 +122,6 @@ async def extract_data(popup: Page, numero: str) -> Dict[str, Any]:
                             break
     except: pass
 
-    # Movimentações
     movs = []
     seen = set()
     selectors = ["tbody[id*='moviment'] tr", "table[class*='moviment'] tr", ".rich-table-row"]
@@ -169,9 +164,10 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
         try:
             print(f"Acessando TJMG para {doc_type} {doc_digits}...")
             await page.goto(URL, wait_until="domcontentloaded")
-            await wait_pje_loading(page)
+            await wait_loading(page)
 
             # === 1. SELEÇÃO DO TIPO ===
+            # Clica no radio e espera o site reagir
             try:
                 if doc_type.upper() == "CNPJ":
                     await page.locator("input[type='radio'][value='CNPJ'], label:has-text('CNPJ')").first.click()
@@ -179,13 +175,13 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
                     await page.locator("input[type='radio'][value='CPF'], label:has-text('CPF')").first.click()
                 await page.wait_for_timeout(1000)
             except: 
-                print("Erro ao clicar no radio")
+                print("Erro ao clicar no radio (pode já estar selecionado)")
 
-            # === 2. LOCALIZAR INPUT ===
+            # === 2. LOCALIZAR O INPUT E O FRAME CORRETO ===
             fr, target_input = await find_input_any_frame(page)
 
             if not target_input:
-                # Fallback
+                # Fallback: tenta buscar diretamente pelo label
                 target_input = page.locator("td:has-text('CPF'), td:has-text('CNPJ')").locator("xpath=..//input").first
                 fr = page
 
@@ -197,9 +193,14 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
             await target_input.fill("")
             await target_input.type(doc_digits, delay=50)
             
-            # === 4. CLICAR PESQUISAR ===
+            # === 4. CLICAR NO BOTÃO ===
             search_context = fr if fr else page
-            btn_selectors = ["input[value='PESQUISAR']", "button:has-text('PESQUISAR')", "a:has-text('PESQUISAR')", "input[type='submit']"]
+            btn_selectors = [
+                "input[value='PESQUISAR']", 
+                "button:has-text('PESQUISAR')", 
+                "a:has-text('PESQUISAR')",
+                "input[type='submit']"
+            ]
             
             btn = None
             for sel in btn_selectors:
@@ -212,13 +213,15 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
                 btn = page.get_by_role("button", name="PESQUISAR").first
             
             await btn.click()
-            await wait_pje_loading(page)
             
+            await wait_loading(page)
+            
+            # Espera tabela ou erro
             try:
                 await page.wait_for_selector("a.btn-detalhes, a[href*='Processo'], .rich-messages", timeout=8000)
             except: pass
 
-            # === 5. EXTRAIR ===
+            # === 5. EXTRAIR DADOS ===
             links = page.locator("a").filter(has_text=CNJ_RE)
             count = await links.count()
             print(f"Links encontrados: {count}")
@@ -253,8 +256,44 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
 
         except Exception as e:
             print(f"Erro geral: {e}")
-            await browser.close()
+            await browser.close() # <--- CORRIGIDO AQUI
             raise HTTPException(status_code=500, detail=str(e))
 
-        await browser.close()
-    return result    
+        await browser.close() # <--- CORRIGIDO AQUI TAMBÉM
+    return result
+
+@app.get("/health")
+def health():
+    return {"ok": True, "status": "online"}
+
+@app.get("/consulta")
+async def consulta(
+    doc: str = Query(..., description="CPF/CNPJ"),
+    tipo: str = Query("CPF", description="CPF ou CNPJ")
+):
+    doc_clean = sanitize_id(doc)
+    doc_type = tipo.upper() if tipo else "CPF"
+    
+    if doc_type == "CNPJ" and len(doc_clean) < 14:
+        raise HTTPException(status_code=400, detail="CNPJ incompleto")
+    if doc_type == "CPF" and len(doc_clean) < 11:
+        raise HTTPException(status_code=400, detail="CPF incompleto")
+
+    cache_key = f"{doc_type}_{doc_clean}"
+    now = time.time()
+    
+    cached = _cache.get(cache_key)
+    if cached and (now - cached["ts"]) < CACHE_TTL:
+        return cached["data"]
+
+    async with SEMA:
+        cached = _cache.get(cache_key)
+        if cached and (time.time() - cached["ts"]) < CACHE_TTL:
+            return cached["data"]
+            
+        try:
+            data = await asyncio.wait_for(scrape_pje(doc_clean, doc_type), timeout=180)
+            _cache[cache_key] = {"ts": time.time(), "data": data}
+            return data
+        except asyncio.TimeoutError:
+             raise HTTPException(status_code=504, detail="Timeout no tribunal")
