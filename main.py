@@ -212,29 +212,35 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
             if not doc_input:
                 raise Exception("Input de CPF/CNPJ não encontrado.")
 
-            # 1. Troca o Radio Button (SEMPRE primeiro)
+            # 1. Troca o Radio Button
             await force_set_doc_type_radio(page, fr, doc_type)
-            
-            # AGUARDA DOM ATUALIZAR (CRÍTICO PARA CNPJ)
             await page.wait_for_timeout(1500)
-            
-            # Recarrega referência do input pois o DOM mudou
             fr, doc_input = await find_input_any_frame(page)
             
             # 2. Digita com Verificação
-            # Se a verificação falhar, tentamos trocar o rádio novamente e redigitar
             match = await ensure_input_match(page, doc_input, doc_digits)
             
+            # --- ESTRATÉGIA DE TOGGLE (NOVA CORREÇÃO) ---
             if not match:
-                # RETRY LOGIC: Tenta clicar no rádio de novo
-                print("Primeira tentativa falhou. Refazendo seleção de tipo...")
+                print("Primeira tentativa falhou. Aplicando estratégia de Toggle (Troca e Destroca)...")
+                
+                # Se era CNPJ, clica em CPF e volta pra CNPJ para forçar o evento de mudança
+                other_type = "CPF" if doc_type == "CNPJ" else "CNPJ"
+                
+                # Clica no errado
+                await force_set_doc_type_radio(page, fr, other_type)
+                await page.wait_for_timeout(1000)
+                
+                # Clica no certo de novo
                 await force_set_doc_type_radio(page, fr, doc_type)
-                await page.wait_for_timeout(1500)
+                await page.wait_for_timeout(2000) # Espera maior para máscara carregar
+                
+                # Tenta digitar de novo
                 fr, doc_input = await find_input_any_frame(page)
                 match = await ensure_input_match(page, doc_input, doc_digits)
 
             if not match:
-                raise Exception(f"Falha ao preencher campo. Máscara incorreta para {doc_type}?")
+                raise Exception(f"Falha crítica: O site não aceitou os {len(doc_digits)} dígitos. Máscara travada?")
 
             # 3. Pesquisar
             btn = fr.locator("button:has-text('PESQUISAR'), input[type='submit'][value*='PESQUISAR' i]").first
