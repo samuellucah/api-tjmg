@@ -1,6 +1,6 @@
 # 1. Usa a imagem oficial que JÁ CONTÉM Python, Chromium e dependências
 # Isso evita o download gigante na hora do deploy
-FROM mcr.microsoft.com/playwright/python:v1.49.0-jammy
+FROM mcr.microsoft.com/playwright/python:v1.56.0-jammy
 
 # 2. Define a pasta de trabalho
 WORKDIR /app
