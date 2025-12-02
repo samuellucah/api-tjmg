@@ -91,7 +91,6 @@ async def ensure_input_match(page, input_locator, expected_digits: str):
     1. Tenta digitar normalmente.
     2. Se falhar, INJETA o valor via JavaScript (ignora a máscara).
     """
-    # Tentativa 1 e 2: Digitação Humana
     for attempt in range(2):
         try:
             await input_locator.click()
@@ -112,7 +111,6 @@ async def ensure_input_match(page, input_locator, expected_digits: str):
         except:
             pass
 
-    # TENTATIVA FINAL: INJEÇÃO DIRETA VIA JAVASCRIPT
     print("Digitação falhou. Forçando valor via JS...")
     try:
         await input_locator.evaluate(f"""(el) => {{
@@ -123,7 +121,6 @@ async def ensure_input_match(page, input_locator, expected_digits: str):
         }}""")
         await page.wait_for_timeout(500)
         
-        # Confere se colou
         raw_val = await input_locator.input_value()
         clean_val = re.sub(r"\D+", "", raw_val)
         return clean_val == expected_digits
@@ -192,6 +189,30 @@ async def extract_movements(popup) -> List[str]:
             continue
     return texts[:10]
 
+# --- NOVA FUNÇÃO INTELIGENTE DE BUSCA DE RESULTADOS ---
+async def find_results_frame_and_links(page):
+    """
+    Escaneia a página principal e TODOS os frames procurando onde estão os resultados (CNJ).
+    Retorna (frame_encontrado, locator_dos_links).
+    """
+    frames = [page.main_frame] + page.frames
+    
+    for fr in frames:
+        try:
+            # Procura links <a> com CNJ
+            links = fr.locator("a").filter(has_text=CNJ_RE)
+            if await links.count() > 0:
+                return fr, links
+            
+            # Fallback: Procura linhas <tr> com CNJ (caso não seja link direto)
+            rows = fr.locator("tr").filter(has_text=CNJ_RE)
+            if await rows.count() > 0:
+                return fr, rows
+        except:
+            continue
+            
+    return None, None
+
 async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
     result = {
         "documento": doc_digits,
@@ -215,22 +236,19 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
             await page.goto(URL, wait_until="domcontentloaded", timeout=45000)
             await page.wait_for_timeout(2000)
 
-            # 1. Busca Frame (IMPORTANTE: Guardamos o frame 'fr' para usar depois)
             fr, doc_input = await find_input_any_frame(page)
             if not doc_input:
                 raise Exception("Input de CPF/CNPJ não encontrado.")
 
-            # 2. Troca o Radio Button
+            # 1. Troca o Radio Button
             await force_set_doc_type_radio(page, fr, doc_type)
             await page.wait_for_timeout(1500)
             
-            # Recarrega input (o DOM pode ter mudado)
             fr, doc_input = await find_input_any_frame(page)
             
-            # 3. Digita (com injeção JS se necessário)
+            # 2. Digita (com injeção JS se necessário)
             match = await ensure_input_match(page, doc_input, doc_digits)
             
-            # Toggle se falhar
             if not match:
                 print("Injeção falhou. Tentando Toggle...")
                 other_type = "CPF" if doc_type == "CNPJ" else "CNPJ"
@@ -245,7 +263,7 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
             if not match:
                 result["aviso_site"] = f"Não foi possível digitar o documento completo ({len(doc_digits)} dígitos)."
             
-            # 4. Pesquisar
+            # 3. Pesquisar
             btn = fr.locator("button:has-text('PESQUISAR'), input[type='submit'][value*='PESQUISAR' i]").first
             if await btn.count() == 0:
                 btn = page.locator("button:has-text('PESQUISAR')").first
@@ -261,25 +279,30 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
             except:
                 await page.wait_for_timeout(4000)
 
-            # 5. Captura Resultados (CORREÇÃO IFRAME)
-            # Usamos 'fr' (o frame onde estava o input) para buscar os resultados.
-            # Se 'fr' for None (improvável se achamos input), usamos 'page'.
-            search_scope = fr if fr else page
+            # 4. Captura Resultados (CORREÇÃO FINAL)
+            # Em vez de confiar no frame antigo, ESCANEIAMOS tudo de novo.
+            res_frame, links = await find_results_frame_and_links(page)
             
-            links = search_scope.locator("a").filter(has_text=CNJ_RE)
-            if await links.count() == 0:
-                links = search_scope.locator("tr").filter(has_text=CNJ_RE)
+            if not links or await links.count() == 0:
+                # Se não achou links, procura mensagem de erro globalmente
+                msg = await page.locator(".ui-messages-error").all_inner_texts()
+                # E também dentro dos frames
+                if not msg:
+                    for f in page.frames:
+                        try:
+                            m = await f.locator(".ui-messages-error").all_inner_texts()
+                            if m: 
+                                msg = m
+                                break
+                        except: pass
+                if msg: result["aviso_site"] = msg
+                
+                # Encerra se não achou nada
+                return result
 
             count = await links.count()
-            
-            if count == 0:
-                # Procura aviso no frame e na página
-                msg = await search_scope.locator(".ui-messages-error").all_inner_texts()
-                if not msg:
-                    msg = await page.locator(".ui-messages-error").all_inner_texts()
-                if msg: result["aviso_site"] = msg
-
             seen = set()
+            
             for i in range(count):
                 item = links.nth(i)
                 txt = await item.inner_text()
