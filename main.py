@@ -8,15 +8,15 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, Query, HTTPException
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
-# Permite rodar loops aninhados (necessário para alguns ambientes com Uvicorn/Jupyter)
+# Permite rodar loops aninhados
 nest_asyncio.apply()
 
 URL = "https://pje-consulta-publica.tjmg.jus.br/"
 
-# CNJ: 0000000-00.0000.0.00.0000
+# Regex para encontrar número de processo (CNJ)
 CNJ_RE = re.compile(r"\b\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}\b")
 
-# Filtro para NÃO retornar ruídos (doc/certidão/visualizar/pjeoffice + paginação)
+# Regex para filtrar textos inúteis
 UNWANTED_RE = re.compile(
     r"(documentos?\s+juntados|documento\b|certid[aã]o|visualizar|"
     r"pjeoffice|indispon[ií]vel|aplicativo\s+pjeoffice|"
@@ -31,28 +31,26 @@ def sanitize_doc(doc: str) -> str:
     """Remove tudo que não for número."""
     return re.sub(r"\D+", "", doc or "")
 
-# ===== Concurrency + Cache (para API pública) =====
-SEMA = asyncio.Semaphore(1)          # 1 request por vez (Playwright é pesado)
-CACHE_TTL = 300                      # 5 minutos
-_cache: Dict[str, Dict[str, Any]] = {}  # doc -> {"ts": epoch, "data": result}
+# ===== Concurrency + Cache =====
+SEMA = asyncio.Semaphore(1)          
+CACHE_TTL = 300                      
+_cache: Dict[str, Dict[str, Any]] = {} 
 
 app = FastAPI(title="PJe TJMG - Consulta Pública (scraping)")
 
 async def find_input_any_frame(page):
     """
-    Encontra o input correspondente ao bloco "CPF/CNPJ".
-    Procura em todas as frames (caso o PJe use iframes).
+    Encontra o input de texto onde digita o número.
     """
     frames = [page.main_frame] + [f for f in page.frames if f != page.main_frame]
-
-    # Âncoras perto do bloco CPF/CNPJ
+    
+    # Procura input próximo a label CPF ou CNPJ
     anchor_xpaths = [
         "xpath=//*[contains(.,'CPF') and contains(.,'CNPJ')][1]",
         "xpath=//label[contains(normalize-space(.),'CPF')][1]/parent::*",
         "xpath=//*[contains(normalize-space(.),'CNPJ')][1]/parent::*",
         "xpath=//*[contains(normalize-space(.),'CPF')][1]",
     ]
-    # Tenta achar um input logo após a label
     input_after = "xpath=following::input[(not(@type) or @type='text' or @type='tel') and not(@disabled)][1]"
 
     for fr in frames:
@@ -68,10 +66,42 @@ async def find_input_any_frame(page):
                 pass
     return None, None
 
+async def set_doc_type_radio(page, frame, doc_type: str):
+    """
+    Função CRUCIAL: Seleciona a bolinha (Radio Button) de CPF ou CNPJ.
+    """
+    target = doc_type.upper().strip() # CPF ou CNPJ
+    
+    # Estratégias para achar o botão correto
+    strategies = [
+        # 1. Pelo Label exato (clique no texto)
+        frame.get_by_label(target, exact=True),
+        # 2. Pelo texto que contém a palavra (clique no texto)
+        frame.get_by_text(target, exact=True),
+        # 3. Input do tipo radio com valor ou nome próximo
+        frame.locator(f"input[type='radio'][value='{target}']"),
+        # 4. XPath genérico procurando o input vizinho do texto
+        frame.locator(f"xpath=//label[contains(., '{target}')]//input[@type='radio']"),
+        frame.locator(f"xpath=//span[contains(., '{target}')]//preceding-sibling::input[@type='radio']")
+    ]
+
+    for locator in strategies:
+        try:
+            if await locator.count() > 0 and await locator.first.is_visible():
+                # Tenta dar "check" se for input, ou "click" se for label
+                try:
+                    await locator.first.check(timeout=1000)
+                except:
+                    await locator.first.click(timeout=1000)
+                
+                # Pequena pausa para o site processar a troca
+                await page.wait_for_timeout(500)
+                return True
+        except:
+            continue
+    return False
+
 async def wait_spinner_or_delay(page):
-    """
-    Aguarda o fim do 'spin' do PJe.
-    """
     candidates = ".ui-widget-overlay, .ui-blockui, .ui-progressbar, [class*='loading' i], [class*='spinner' i]"
     loc = page.locator(candidates)
     try:
@@ -111,10 +141,7 @@ async def extract_metadata(popup) -> Dict[str, Optional[str]]:
     try:
         body = await popup.locator("body").inner_text()
     except:
-        return {
-            "assunto": None, "classe_judicial": None, "data_distribuicao": None,
-            "orgao_julgador": None, "jurisdicao": None,
-        }
+        return {"assunto": None, "classe_judicial": None, "data_distribuicao": None, "orgao_julgador": None, "jurisdicao": None}
 
     lines = [_norm(ln) for ln in body.replace("\r", "").split("\n")]
     lines = [ln for ln in lines if ln]
@@ -151,7 +178,6 @@ async def extract_movements(popup) -> List[str]:
         "xpath=//table[.//*[contains(translate(.,'MOVIMENTACOESÇÃ','movimentacoesca'),'moviment')]]//tr",
         "xpath=//ul[.//*[contains(translate(.,'MOVIMENTACOESÇÃ','movimentacoesca'),'moviment')]]//li",
     ]
-
     for sel in selectors:
         try:
             loc = popup.locator(sel)
@@ -177,64 +203,60 @@ async def extract_movements(popup) -> List[str]:
 
     return texts
 
-async def scrape_pje(doc_digits: str) -> Dict[str, Any]:
+async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
     result: Dict[str, Any] = {
         "documento": doc_digits,
+        "tipo": doc_type,
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "processos": [],
     }
 
     async with async_playwright() as p:
-        # Configuração OTIMIZADA para Docker/VPS
         browser = await p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-blink-features=AutomationControlled",
-            ]
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
         )
-        
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             viewport={"width": 1280, "height": 720}
         )
-        
         page = await context.new_page()
 
         try:
             await page.goto(URL, wait_until="domcontentloaded")
             await page.wait_for_timeout(1500)
 
+            # 1. Encontra o frame (se houver) e o campo de input
             fr, doc_input = await find_input_any_frame(page)
             if doc_input is None:
                 raise HTTPException(status_code=500, detail="nao_encontrei_campo_input")
 
-            # Preenche o documento (CPF ou CNPJ)
+            # 2. SELECIONA O TIPO (CPF ou CNPJ) - Passo Novo Importante
+            # Se não conseguir clicar, seguimos tentando digitar (fallback), mas o ideal é clicar.
+            await set_doc_type_radio(page, fr, doc_type)
+
+            # 3. Preenche o documento
             await doc_input.click(timeout=30000)
             await doc_input.fill("")
             await doc_input.type(doc_digits, delay=50)
 
-            # Verifica se preencheu
             typed = (await doc_input.input_value()).strip()
             if not typed:
                 raise HTTPException(status_code=500, detail="falha_ao_digitar_documento")
 
-            # Clica pesquisar
+            # 4. Clica pesquisar
             btn = fr.get_by_role("button", name="PESQUISAR")
             if await btn.count() == 0:
                 btn = page.get_by_role("button", name="PESQUISAR")
             
-            # Tenta clicar no botão de pesquisa
             if await btn.count() > 0:
                 await btn.first.click(timeout=30000)
             else:
-                # Fallback: tentar enter se não achar botão
                 await doc_input.press("Enter")
 
             await wait_spinner_or_delay(page)
 
-            # Lista processos
+            # 5. Lista processos
             proc_links = page.locator("a").filter(has_text=CNJ_RE)
             count = await proc_links.count()
 
@@ -247,27 +269,19 @@ async def scrape_pje(doc_digits: str) -> Dict[str, Any]:
 
                 popup = await open_process_popup(page, link)
                 if popup is None:
-                    # tenta ícone próximo
                     icon = link.locator("xpath=ancestor::*[self::tr or self::div][1]//a[1]")
                     if await icon.count() > 0:
                         popup = await open_process_popup(page, icon.first)
 
                 if popup is None:
-                    result["processos"].append({
-                        "numero": numero,
-                        "erro": "nao_abriu_popup"
-                    })
+                    result["processos"].append({"numero": numero, "erro": "nao_abriu_popup"})
                     continue
 
                 await popup.wait_for_timeout(1200)
                 meta = await extract_metadata(popup)
                 movs = await extract_movements(popup)
 
-                result["processos"].append({
-                    "numero": numero,
-                    **meta,
-                    "movimentacoes": movs,
-                })
+                result["processos"].append({"numero": numero, **meta, "movimentacoes": movs})
                 await popup.close()
 
         except Exception as e:
@@ -287,43 +301,43 @@ async def consulta(
     doc: str = Query(..., description="Número do documento (CPF ou CNPJ)"),
     tipo: Optional[str] = Query(None, description="Tipo do documento: 'CPF' ou 'CNPJ'")
 ):
-    """
-    Endpoint principal. Recebe 'doc' e opcionalmente 'tipo'.
-    """
     doc_digits = sanitize_doc(doc)
-    
-    # Validação Básica
     if not doc_digits:
         raise HTTPException(status_code=400, detail="documento_vazio")
 
-    # Se o usuário mandou o tipo, validamos o tamanho
+    # Lógica de detecção automática do tipo
+    doc_type = "CPF" # Default
     if tipo:
-        tipo_upper = tipo.upper().strip()
-        if tipo_upper == "CPF" and len(doc_digits) != 11:
-            raise HTTPException(status_code=400, detail="cpf_invalido_deve_ter_11_digitos")
-        elif tipo_upper == "CNPJ" and len(doc_digits) != 14:
-            raise HTTPException(status_code=400, detail="cnpj_invalido_deve_ter_14_digitos")
+        doc_type = tipo.upper().strip()
     else:
-        # Se não mandou tipo, validamos genericamente
-        if len(doc_digits) not in [11, 14]:
-             raise HTTPException(status_code=400, detail="documento_invalido_tamanho_incorreto")
+        # Se não enviou tipo, detecta pelo tamanho
+        if len(doc_digits) == 14:
+            doc_type = "CNPJ"
+        elif len(doc_digits) == 11:
+            doc_type = "CPF"
+    
+    # Validação de tamanho baseada no tipo detectado
+    if doc_type == "CPF" and len(doc_digits) != 11:
+        raise HTTPException(status_code=400, detail="cpf_invalido_deve_ter_11_digitos")
+    if doc_type == "CNPJ" and len(doc_digits) != 14:
+        raise HTTPException(status_code=400, detail="cnpj_invalido_deve_ter_14_digitos")
 
-    # Sistema de Cache
+    # Cache
+    cache_key = f"{doc_digits}_{doc_type}"
     now = time.time()
-    cached = _cache.get(doc_digits)
+    cached = _cache.get(cache_key)
     if cached and (now - cached["ts"]) < CACHE_TTL:
         return cached["data"]
 
     async with SEMA:
-        # Double check no cache
-        cached = _cache.get(doc_digits)
+        cached = _cache.get(cache_key)
         if cached and (time.time() - cached["ts"]) < CACHE_TTL:
             return cached["data"]
 
         try:
-            # Timeout aumentado para 3 minutos
-            data = await asyncio.wait_for(scrape_pje(doc_digits), timeout=180)
-            _cache[doc_digits] = {"ts": time.time(), "data": data}
+            # Passamos o doc_type para o scraper saber qual botão clicar
+            data = await asyncio.wait_for(scrape_pje(doc_digits, doc_type), timeout=180)
+            _cache[cache_key] = {"ts": time.time(), "data": data}
             return data
         except asyncio.TimeoutError:
             raise HTTPException(status_code=504, detail="timeout_tjmg_demorou_muito")
