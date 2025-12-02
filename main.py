@@ -8,15 +8,15 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, Query, HTTPException
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
-# Permite rodar loops aninhados
+# Permite loops aninhados (essencial para FastAPI + Playwright)
 nest_asyncio.apply()
 
 URL = "https://pje-consulta-publica.tjmg.jus.br/"
 
-# Regex para encontrar número de processo (CNJ)
+# Regex CNJ: 0000000-00.0000.0.00.0000
 CNJ_RE = re.compile(r"\b\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}\b")
 
-# Regex para filtrar textos inúteis
+# Filtra ruídos do texto extraído
 UNWANTED_RE = re.compile(
     r"(documentos?\s+juntados|documento\b|certid[aã]o|visualizar|"
     r"pjeoffice|indispon[ií]vel|aplicativo\s+pjeoffice|"
@@ -28,28 +28,25 @@ def _norm(txt: str) -> str:
     return re.sub(r"\s+", " ", (txt or "")).strip()
 
 def sanitize_doc(doc: str) -> str:
-    """Remove tudo que não for número."""
     return re.sub(r"\D+", "", doc or "")
 
-# ===== Concurrency + Cache =====
+# Limita a 1 requisição simultânea para não estourar a memória da VPS
 SEMA = asyncio.Semaphore(1)          
 CACHE_TTL = 300                      
 _cache: Dict[str, Dict[str, Any]] = {} 
 
-app = FastAPI(title="PJe TJMG - Consulta Pública (scraping)")
+app = FastAPI(title="PJe TJMG - Scraper")
+
+# --- FUNÇÕES AUXILIARES ---
 
 async def find_input_any_frame(page):
-    """
-    Encontra o input de texto onde digita o número.
-    """
+    """Procura o campo de input em todos os frames/iframes."""
     frames = [page.main_frame] + [f for f in page.frames if f != page.main_frame]
     
-    # Procura input próximo a label CPF ou CNPJ
     anchor_xpaths = [
         "xpath=//*[contains(.,'CPF') and contains(.,'CNPJ')][1]",
         "xpath=//label[contains(normalize-space(.),'CPF')][1]/parent::*",
         "xpath=//*[contains(normalize-space(.),'CNPJ')][1]/parent::*",
-        "xpath=//*[contains(normalize-space(.),'CPF')][1]",
     ]
     input_after = "xpath=following::input[(not(@type) or @type='text' or @type='tel') and not(@disabled)][1]"
 
@@ -57,292 +54,212 @@ async def find_input_any_frame(page):
         for ax in anchor_xpaths:
             try:
                 anchor = fr.locator(ax)
-                if await anchor.count() == 0:
-                    continue
-                candidate = anchor.first.locator(input_after).first
-                if await candidate.count() > 0 and await candidate.is_visible():
-                    return fr, candidate
+                if await anchor.count() > 0:
+                    candidate = anchor.first.locator(input_after).first
+                    if await candidate.count() > 0 and await candidate.is_visible():
+                        return fr, candidate
             except:
                 pass
     return None, None
 
 async def force_set_doc_type_radio(page, frame, doc_type: str):
-    """
-    Função BLINDADA: Tenta clicar e, se falhar, força via JavaScript.
-    """
-    target = doc_type.upper().strip() # CPF ou CNPJ
+    """Força a seleção do Radio Button (CPF/CNPJ)."""
+    target = doc_type.upper().strip()
     
-    # 1. Localizadores possíveis
+    # Tenta seletores comuns
     locators = [
         frame.get_by_label(target, exact=True),
         frame.locator(f"input[type='radio'][value='{target}']"),
-        frame.locator(f"xpath=//label[contains(., '{target}')]/preceding-sibling::input[@type='radio']"),
         frame.locator(f"xpath=//label[contains(., '{target}')]//input[@type='radio']"),
         frame.get_by_text(target, exact=True)
     ]
 
-    selected = False
-    
     for loc in locators:
         try:
             if await loc.count() > 0:
                 # Tenta check normal
                 if await loc.first.is_visible():
                     await loc.first.check(force=True, timeout=1000)
-                    selected = True
-                else:
-                    # Se tiver escondido, tenta via JS
-                    await loc.first.evaluate("el => el.checked = true")
-                    await loc.first.evaluate("el => el.click()") # Dispara evento
-                    selected = True
-                
-                if selected:
-                    break
+                    await page.wait_for_timeout(200)
+                    return True
+                # Se falhar ou estiver oculto, tenta JS direto
+                await loc.first.evaluate("el => el.click()")
+                return True
         except:
             continue
             
-    # Fallback Javascript Puro (caso os seletores do Playwright falhem)
-    # Procura qualquer input radio que tenha o valor CNPJ ou esteja perto do texto CNPJ
-    if not selected:
-        try:
-            await frame.evaluate(f"""() => {{
-                const radios = Array.from(document.querySelectorAll('input[type="radio"]'));
-                for (const r of radios) {{
-                    // Tenta pelo valor
-                    if (r.value === '{target}') {{
-                        r.checked = true;
-                        r.click();
-                        return;
-                    }}
-                    // Tenta pelo label próximo
-                    if (r.nextSibling && r.nextSibling.textContent && r.nextSibling.textContent.includes('{target}')) {{
-                        r.checked = true;
-                        r.click();
-                        return;
-                    }}
-                    // Tenta pelo label pai
-                    if (r.parentElement && r.parentElement.textContent.includes('{target}')) {{
-                        r.checked = true;
-                        r.click();
-                        return;
-                    }}
-                }}
-            }}""")
-        except:
-            pass
-
-    await page.wait_for_timeout(500)
-    return True
-
-async def wait_spinner_or_delay(page):
-    candidates = ".ui-widget-overlay, .ui-blockui, .ui-progressbar, [class*='loading' i], [class*='spinner' i]"
-    loc = page.locator(candidates)
-    try:
-        await loc.first.wait_for(state="visible", timeout=2000)
-        await loc.first.wait_for(state="hidden", timeout=25000)
-    except PlaywrightTimeoutError:
-        await page.wait_for_timeout(5000)
+    return False
 
 async def open_process_popup(page, clickable):
+    """Clica no link do processo e espera a nova aba/popup abrir."""
     try:
-        async with page.expect_popup(timeout=20000) as pop:
-            await clickable.click(timeout=60000)
+        async with page.expect_popup(timeout=15000) as pop:
+            await clickable.click(timeout=10000)
         popup = await pop.value
         await popup.wait_for_load_state("domcontentloaded")
         return popup
-    except PlaywrightTimeoutError:
+    except:
         return None
 
-async def try_click_movements_tab(popup):
-    candidates = [
-        popup.get_by_role("tab", name=re.compile(r"Movimenta", re.I)),
-        popup.get_by_role("button", name=re.compile(r"Movimenta", re.I)),
-        popup.get_by_role("link", name=re.compile(r"Movimenta", re.I)),
-        popup.locator("text=/Movimenta(ç|c)ões/i"),
-        popup.locator("text=/Movimenta(ç|c)ões do Processo/i"),
-    ]
-    for c in candidates:
-        try:
-            if await c.count() > 0 and await c.first.is_visible():
-                await c.first.click(timeout=4000)
-                await popup.wait_for_timeout(800)
-                return
-        except:
-            pass
-
 async def extract_metadata(popup) -> Dict[str, Optional[str]]:
+    """Extrai dados básicos do processo."""
     try:
         body = await popup.locator("body").inner_text()
     except:
-        return {"assunto": None, "classe_judicial": None, "data_distribuicao": None, "orgao_julgador": None, "jurisdicao": None}
+        return {}
 
-    lines = [_norm(ln) for ln in body.replace("\r", "").split("\n")]
-    lines = [ln for ln in lines if ln]
-
-    def find_value(keys: List[str]) -> Optional[str]:
+    lines = [_norm(ln) for ln in body.split("\n") if ln.strip()]
+    
+    def find(keys):
         keys_l = [k.lower() for k in keys]
         for i, ln in enumerate(lines):
             low = ln.lower()
             if any(k in low for k in keys_l):
-                parts = re.split(r"[:\-]\s*", ln, maxsplit=1)
+                parts = ln.split(":", 1)
                 if len(parts) == 2 and parts[1].strip():
                     val = parts[1].strip()
                     if not UNWANTED_RE.search(val): return val
-                if i + 1 < len(lines) and lines[i + 1]:
-                    val = lines[i + 1]
+                if i + 1 < len(lines):
+                    val = lines[i+1]
                     if not UNWANTED_RE.search(val): return val
         return None
 
     return {
-        "assunto": find_value(["assunto", "assunto(s)"]),
-        "classe_judicial": find_value(["classe judicial", "classe"]),
-        "data_distribuicao": find_value(["data da distribuição", "distribuição"]),
-        "orgao_julgador": find_value(["órgão julgador", "orgao julgador"]),
-        "jurisdicao": find_value(["jurisdição", "jurisdicao", "comarca"]),
+        "assunto": find(["assunto"]),
+        "classe_judicial": find(["classe judicial", "classe"]),
+        "data_distribuicao": find(["distribuição"]),
+        "orgao_julgador": find(["órgão julgador"]),
+        "jurisdicao": find(["jurisdição", "comarca"]),
     }
 
 async def extract_movements(popup) -> List[str]:
-    await try_click_movements_tab(popup)
-    texts: List[str] = []
+    """Extrai as movimentações da tabela."""
+    texts = []
     seen = set()
-    selectors = [
-        "css=[id*='moviment' i] tr", "css=[class*='moviment' i] tr",
-        "css=[id*='moviment' i] li", "css=[class*='moviment' i] li",
-        "xpath=//table[.//*[contains(translate(.,'MOVIMENTACOESÇÃ','movimentacoesca'),'moviment')]]//tr",
-        "xpath=//ul[.//*[contains(translate(.,'MOVIMENTACOESÇÃ','movimentacoesca'),'moviment')]]//li",
-    ]
-    for sel in selectors:
-        try:
-            loc = popup.locator(sel)
-            cnt = await loc.count()
-            if cnt == 0: continue
-            for i in range(min(cnt, 500)):
-                t = _norm(await loc.nth(i).inner_text())
-                if not t or UNWANTED_RE.search(t) or t in seen: continue
-                seen.add(t)
-                texts.append(t)
-            if len(texts) >= 5: break
-        except: pass
+    
+    # Tenta clicar na aba de movimentações se existir
+    try:
+        tab = popup.locator("text=/Movimenta(ç|c)ões/i")
+        if await tab.count() > 0:
+            await tab.first.click(timeout=2000)
+            await popup.wait_for_timeout(500)
+    except:
+        pass
 
-    if not texts:
+    # Estratégia genérica: pegar todas as linhas de tabelas
+    rows = popup.locator("tr")
+    count = await rows.count()
+    
+    # Limita para não travar em tabelas gigantes
+    for i in range(min(count, 100)):
         try:
-            body = await popup.locator("body").inner_text()
-            for ln in body.split("\n"):
-                t = _norm(ln)
-                if not t or UNWANTED_RE.search(t) or t in seen: continue
-                seen.add(t)
-                texts.append(t)
-        except: pass
-
-    return texts
+            txt = _norm(await rows.nth(i).inner_text())
+            if len(txt) > 10 and not UNWANTED_RE.search(txt) and txt not in seen:
+                seen.add(txt)
+                texts.append(txt)
+        except:
+            continue
+            
+    return texts[:10] # Retorna as 10 primeiras movimentações
 
 async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
-    result: Dict[str, Any] = {
+    result = {
         "documento": doc_digits,
         "tipo": doc_type,
         "timestamp": datetime.utcnow().isoformat() + "Z",
-        "processos": [],
+        "processos": []
     }
 
     async with async_playwright() as p:
+        # --- CONFIGURAÇÃO LEVE PARA VPS ---
         browser = await p.chromium.launch(
             headless=True,
-            # Importante: Args extras para evitar detecção e melhorar performance
-            args=[
-                "--no-sandbox", 
-                "--disable-setuid-sandbox", 
-                "--disable-blink-features=AutomationControlled",
-                "--ignore-certificate-errors"
-            ]
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
         )
+        
+        # Contexto simples sem locale definido (evita crash)
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-            viewport={"width": 1366, "height": 768},
-            locale="pt-BR"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 720}
         )
-        page = await context.new_page()
-
+        
         try:
-            await page.goto(URL, wait_until="domcontentloaded")
-            await page.wait_for_timeout(2000) # Espera inicial generosa
+            page = await context.new_page()
+            await page.goto(URL, wait_until="domcontentloaded", timeout=45000)
+            await page.wait_for_timeout(2000)
 
-            # 1. Encontra o frame e o input
+            # 1. Busca Frame e Input
             fr, doc_input = await find_input_any_frame(page)
-            if doc_input is None:
-                raise HTTPException(status_code=500, detail="nao_encontrei_campo_input")
+            if not doc_input:
+                raise Exception("Input de CPF/CNPJ não encontrado na página.")
 
-            # 2. LIMPA E PREENCHE PRIMEIRO O DOCUMENTO (Estratégia Anti-Reset)
-            await doc_input.click(timeout=10000)
+            # 2. Limpa e Digita
+            await doc_input.click()
             await doc_input.fill("")
-            # Digita mais devagar para parecer humano
-            await doc_input.type(doc_digits, delay=100) 
-            
-            # 3. AGORA SIM, FORÇA A SELEÇÃO DO TIPO
+            await doc_input.type(doc_digits, delay=80)
+
+            # 3. Força Radio Button
             await force_set_doc_type_radio(page, fr, doc_type)
 
-            # 4. Verifica se o texto ainda está lá (alguns sites limpam ao mudar o radio)
-            typed = (await doc_input.input_value()).strip()
-            if typed != doc_digits:
-                await doc_input.fill("")
-                await doc_input.type(doc_digits, delay=50)
-
-            # 5. Clica pesquisar
+            # 4. Pesquisa
             btn = fr.get_by_role("button", name="PESQUISAR")
             if await btn.count() == 0:
                 btn = page.get_by_role("button", name="PESQUISAR")
             
             if await btn.count() > 0:
-                await btn.first.click(timeout=30000)
+                await btn.first.click()
             else:
                 await doc_input.press("Enter")
-
-            await wait_spinner_or_delay(page)
-
-            # 6. Lista processos
-            # Procura links que contenham o padrão CNJ
-            proc_links = page.locator("a").filter(has_text=CNJ_RE)
             
-            # Pequeno wait extra para garantir renderização da tabela
+            # Espera carregamento (spinners)
             try:
-                await proc_links.first.wait_for(state="attached", timeout=4000)
+                await page.locator(".ui-progressbar").wait_for(state="visible", timeout=1000)
+                await page.locator(".ui-progressbar").wait_for(state="hidden", timeout=20000)
             except:
-                pass
+                await page.wait_for_timeout(3000)
 
-            count = await proc_links.count()
+            # 5. Coleta Processos
+            links = page.locator("a").filter(has_text=CNJ_RE)
+            count = await links.count()
+            
+            if count == 0:
+                # Tenta ver se deu mensagem de erro na tela
+                msg = await page.locator(".ui-messages-error").all_inner_texts()
+                if msg:
+                    result["aviso_site"] = msg
 
             for i in range(count):
-                link = proc_links.nth(i)
-                txt = _norm(await link.inner_text())
+                link = links.nth(i)
+                txt = await link.inner_text()
+                # Extrai apenas números do CNJ
                 m = CNJ_RE.search(txt)
                 if not m: continue
                 numero = m.group(0)
 
+                # Abre popup
                 popup = await open_process_popup(page, link)
-                if popup is None:
-                    # Tenta ícone da lupa/pasta se houver
-                    icon = link.locator("xpath=ancestor::*[self::tr or self::div][1]//a[contains(@title, 'Visualizar') or contains(@class, 'visualizar')]")
-                    if await icon.count() > 0:
-                        popup = await open_process_popup(page, icon.first)
-
-                if popup is None:
-                    result["processos"].append({"numero": numero, "erro": "nao_abriu_popup"})
-                    continue
-
-                await popup.wait_for_timeout(1500)
-                meta = await extract_metadata(popup)
-                movs = await extract_movements(popup)
-
-                result["processos"].append({"numero": numero, **meta, "movimentacoes": movs})
-                await popup.close()
+                if popup:
+                    meta = await extract_metadata(popup)
+                    movs = await extract_movements(popup)
+                    result["processos"].append({
+                        "numero": numero,
+                        **meta,
+                        "movimentacoes": movs
+                    })
+                    await popup.close()
+                else:
+                    result["processos"].append({"numero": numero, "erro": "popup_bloqueado"})
 
         except Exception as e:
+            print(f"ERRO SCRAPING: {e}") 
+            result["erro_interno"] = str(e)
+        
+        finally:
             await browser.close()
-            # Retorna o erro detalhado para ajudar no debug
-            raise HTTPException(status_code=500, detail=f"Erro no scraping: {str(e)}")
-
-        await browser.close()
 
     return result
+
+# --- API ENDPOINTS ---
 
 @app.get("/health")
 def health():
@@ -350,16 +267,39 @@ def health():
 
 @app.get("/consulta")
 async def consulta(
-    doc: str = Query(..., description="Número do documento (CPF ou CNPJ)"),
-    tipo: Optional[str] = Query(None, description="Tipo do documento: 'CPF' ou 'CNPJ'")
+    doc: str = Query(..., description="CPF ou CNPJ"),
+    tipo: Optional[str] = Query(None)
 ):
+    # Tratamento de entrada
     doc_digits = sanitize_doc(doc)
-    if not doc_digits:
-        raise HTTPException(status_code=400, detail="documento_vazio")
-
-    # Lógica de detecção automática do tipo
-    doc_type = "CPF" # Default
+    
+    # Detecção automática de tipo
+    doc_type = "CPF"
     if tipo:
         doc_type = tipo.upper().strip()
-    else:
-        if len(doc_digits)
+    elif len(doc_digits) == 14:
+        doc_type = "CNPJ"
+    
+    # Validação rápida
+    if len(doc_digits) not in [11, 14]:
+         raise HTTPException(status_code=400, detail="Documento inválido (deve ter 11 ou 14 dígitos)")
+
+    # Cache
+    cache_key = f"{doc_digits}_{doc_type}"
+    now = time.time()
+    if cache_key in _cache:
+        item = _cache[cache_key]
+        if (now - item["ts"]) < CACHE_TTL:
+            return item["data"]
+
+    # Controle de concorrência (fila de espera)
+    try:
+        async with asyncio.timeout(180): # Timeout geral de 3 minutos
+            async with SEMA:
+                data = await scrape_pje(doc_digits, doc_type)
+                _cache[cache_key] = {"ts": now, "data": data}
+                return data
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Tempo limite excedido (Site do Tribunal lento)")
+    except Exception as e:
+         raise HTTPException(status_code=500, detail=str(e))
