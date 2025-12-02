@@ -1,7 +1,4 @@
 fastapi
 uvicorn
-
-Travamos a versão para evitar conflito com a imagem Docker
-
 playwright==1.49.0
 nest_asyncio
