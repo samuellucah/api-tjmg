@@ -75,13 +75,10 @@ async def force_set_doc_type_radio(page, frame, doc_type: str) -> bool:
     for loc in locators:
         try:
             if await loc.count() > 0:
-                # Tenta marcar
                 if await loc.first.is_visible():
                     await loc.first.check(force=True, timeout=1000)
                 else:
                     await loc.first.evaluate("el => el.click()")
-                
-                # Aguarda troca de máscara
                 await page.wait_for_timeout(1000)
                 return True
         except:
@@ -90,38 +87,49 @@ async def force_set_doc_type_radio(page, frame, doc_type: str) -> bool:
 
 async def ensure_input_match(page, input_locator, expected_digits: str):
     """
-    GARANTIA DE PREENCHIMENTO MELHORADA:
-    Usa limpeza via teclado (Ctrl+A -> Del) que é mais robusta contra máscaras JS.
+    GARANTIA DE PREENCHIMENTO (COM FORÇA BRUTA JS):
+    1. Tenta digitar normalmente.
+    2. Se falhar, INJETA o valor via JavaScript (ignora a máscara).
     """
-    for attempt in range(3):
+    # Tentativa 1 e 2: Digitação Humana
+    for attempt in range(2):
         try:
             await input_locator.click()
-            # Limpeza agressiva via teclado
             await input_locator.press("Control+A")
             await input_locator.press("Backspace")
-            
             await page.wait_for_timeout(300)
-            
-            # Digita dígito por dígito
             await input_locator.type(expected_digits, delay=80)
             await page.wait_for_timeout(500)
             
-            # Confere o valor
             raw_val = await input_locator.input_value()
             clean_val = re.sub(r"\D+", "", raw_val)
             
             if clean_val == expected_digits:
-                return True # Sucesso
+                return True 
             
-            # Se falhou, tenta sair do campo (Tab) e voltar na próxima
             await page.keyboard.press("Tab")
             await page.wait_for_timeout(500)
-            print(f"Tentativa {attempt+1}: Esperado {expected_digits}, Encontrado {clean_val}. Retentando...")
-            
         except:
             pass
-            
-    return False
+
+    # TENTATIVA FINAL: INJEÇÃO DIRETA VIA JAVASCRIPT
+    # Isso passa por cima de qualquer bloqueio visual/máscara do site
+    print("Digitação falhou. Forçando valor via JS...")
+    try:
+        await input_locator.evaluate(f"""(el) => {{
+            el.value = '{expected_digits}';
+            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+            el.dispatchEvent(new Event('blur', {{ bubbles: true }}));
+        }}""")
+        await page.wait_for_timeout(500)
+        
+        # Confere se colou
+        raw_val = await input_locator.input_value()
+        clean_val = re.sub(r"\D+", "", raw_val)
+        return clean_val == expected_digits
+    except:
+        return False
 
 async def open_process_popup(page, clickable):
     try:
@@ -217,32 +225,26 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
             await page.wait_for_timeout(1500)
             fr, doc_input = await find_input_any_frame(page)
             
-            # 2. Digita com Verificação
+            # 2. Digita (com injeção JS se necessário)
             match = await ensure_input_match(page, doc_input, doc_digits)
             
-            # --- ESTRATÉGIA DE TOGGLE (NOVA CORREÇÃO) ---
+            # 3. Se falhou, tenta a estratégia de Toggle (último recurso)
             if not match:
-                print("Primeira tentativa falhou. Aplicando estratégia de Toggle (Troca e Destroca)...")
-                
-                # Se era CNPJ, clica em CPF e volta pra CNPJ para forçar o evento de mudança
+                print("Injeção falhou. Tentando Toggle...")
                 other_type = "CPF" if doc_type == "CNPJ" else "CNPJ"
-                
-                # Clica no errado
                 await force_set_doc_type_radio(page, fr, other_type)
                 await page.wait_for_timeout(1000)
-                
-                # Clica no certo de novo
                 await force_set_doc_type_radio(page, fr, doc_type)
-                await page.wait_for_timeout(2000) # Espera maior para máscara carregar
+                await page.wait_for_timeout(2000)
                 
-                # Tenta digitar de novo
                 fr, doc_input = await find_input_any_frame(page)
                 match = await ensure_input_match(page, doc_input, doc_digits)
 
             if not match:
-                raise Exception(f"Falha crítica: O site não aceitou os {len(doc_digits)} dígitos. Máscara travada?")
-
-            # 3. Pesquisar
+                # Retorna aviso mas não quebra tudo
+                result["aviso_site"] = f"Não foi possível digitar o documento completo ({len(doc_digits)} dígitos). O site pode estar travado."
+            
+            # 4. Pesquisar
             btn = fr.locator("button:has-text('PESQUISAR'), input[type='submit'][value*='PESQUISAR' i]").first
             if await btn.count() == 0:
                 btn = page.locator("button:has-text('PESQUISAR')").first
@@ -252,14 +254,13 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
             else:
                 await doc_input.press("Enter")
             
-            # Espera resultados
             try:
                 await page.locator(".ui-progressbar").wait_for(state="visible", timeout=2000)
                 await page.locator(".ui-progressbar").wait_for(state="hidden", timeout=25000)
             except:
                 await page.wait_for_timeout(4000)
 
-            # 4. Captura Resultados
+            # 5. Captura Resultados
             links = page.locator("a").filter(has_text=CNJ_RE)
             if await links.count() == 0:
                 links = page.locator("tr").filter(has_text=CNJ_RE)
