@@ -177,7 +177,7 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
             args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
         )
         
-        # Contexto simples sem locale definido (evita crash)
+        # Contexto simples
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
             viewport={"width": 1280, "height": 720}
@@ -223,7 +223,6 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
             count = await links.count()
             
             if count == 0:
-                # Tenta ver se deu mensagem de erro na tela
                 msg = await page.locator(".ui-messages-error").all_inner_texts()
                 if msg:
                     result["aviso_site"] = msg
@@ -231,7 +230,6 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
             for i in range(count):
                 link = links.nth(i)
                 txt = await link.inner_text()
-                # Extrai apenas números do CNJ
                 m = CNJ_RE.search(txt)
                 if not m: continue
                 numero = m.group(0)
@@ -292,13 +290,19 @@ async def consulta(
         if (now - item["ts"]) < CACHE_TTL:
             return item["data"]
 
-    # Controle de concorrência (fila de espera)
+    # Controle de concorrência e Timeout (Corrigido para Python 3.10)
     try:
-        async with asyncio.timeout(180): # Timeout geral de 3 minutos
+        # Função auxiliar para encapsular a chamada com semáforo
+        async def _scrape_safe():
             async with SEMA:
-                data = await scrape_pje(doc_digits, doc_type)
-                _cache[cache_key] = {"ts": now, "data": data}
-                return data
+                return await scrape_pje(doc_digits, doc_type)
+
+        # wait_for é compatível com Python 3.10
+        data = await asyncio.wait_for(_scrape_safe(), timeout=180)
+        
+        _cache[cache_key] = {"ts": now, "data": data}
+        return data
+
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="Tempo limite excedido (Site do Tribunal lento)")
     except Exception as e:
