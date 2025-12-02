@@ -61,70 +61,27 @@ async def find_input_any_frame(page):
                 pass
     return None, None
 
-async def force_set_doc_type_radio(page, frame, doc_type: str) -> bool:
-    """Força a seleção do Radio Button."""
-    target = (doc_type or "").upper().strip()
-    
-    locators = [
-        frame.get_by_label(target, exact=True),
-        frame.locator(f"input[type='radio'][value='{target}']"),
-        frame.locator(f"xpath=//label[contains(normalize-space(.), '{target}')]//input[@type='radio']"),
-        frame.get_by_text(target, exact=True)
-    ]
-
-    for loc in locators:
-        try:
-            if await loc.count() > 0:
-                if await loc.first.is_visible():
-                    await loc.first.check(force=True, timeout=1000)
-                else:
-                    await loc.first.evaluate("el => el.click()")
-                await page.wait_for_timeout(1000)
-                return True
-        except:
-            continue
-    return False
-
-async def ensure_input_match(page, input_locator, expected_digits: str):
+async def select_radio_by_index(page, frame, index: int):
     """
-    GARANTIA DE PREENCHIMENTO:
-    1. Tenta digitar normalmente.
-    2. Se falhar, INJETA o valor via JavaScript.
+    Clica no Radio Button baseado na posição visual (0-based).
     """
-    for attempt in range(2):
-        try:
-            await input_locator.click()
-            await input_locator.press("Control+A")
-            await input_locator.press("Backspace")
-            await page.wait_for_timeout(300)
-            await input_locator.type(expected_digits, delay=80)
-            await page.wait_for_timeout(500)
-            
-            raw_val = await input_locator.input_value()
-            clean_val = re.sub(r"\D+", "", raw_val)
-            
-            if clean_val == expected_digits:
-                return True 
-            
-            await page.keyboard.press("Tab")
-            await page.wait_for_timeout(500)
-        except:
-            pass
-
-    print(f"Digitação falhou (Lido: {clean_val} vs Esperado: {expected_digits}). Forçando JS...")
     try:
-        await input_locator.evaluate(f"""(el) => {{
-            el.value = '{expected_digits}';
-            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-            el.dispatchEvent(new Event('blur', {{ bubbles: true }}));
-        }}""")
-        await page.wait_for_timeout(500)
+        # Busca todos os radios no frame
+        radios = frame.locator("input[type='radio']")
+        count = await radios.count()
+        print(f"DEBUG: Encontrados {count} botões de rádio no frame.")
         
-        raw_val = await input_locator.input_value()
-        clean_val = re.sub(r"\D+", "", raw_val)
-        return clean_val == expected_digits
-    except:
+        if count > index:
+            # Força o clique no índice específico
+            # Em alguns casos do PJe, o input real está escondido e precisamos clicar no label ou span pai.
+            # Mas o force=True do Playwright costuma resolver.
+            await radios.nth(index).click(force=True)
+            return True
+        else:
+            print(f"Erro: Tentou clicar no radio índice {index}, mas só achou {count} radios.")
+            return False
+    except Exception as e:
+        print(f"Erro ao clicar no radio: {e}")
         return False
 
 async def open_process_popup(page, clickable):
@@ -191,30 +148,24 @@ async def extract_movements(popup) -> List[str]:
 
 # --- BUSCA INTELIGENTE DE RESULTADOS ---
 async def wait_and_find_results(page):
-    """
-    Aguarda explicitamente por sinais de sucesso ou falha na pesquisa em TODOS os frames.
-    """
     start_time = time.time()
-    while (time.time() - start_time) < 30: # Espera até 30 segundos
+    while (time.time() - start_time) < 30: 
         frames = [page.main_frame] + page.frames
         for fr in frames:
             try:
-                # 1. Sucesso: Links de Processo
                 links = fr.locator("a").filter(has_text=CNJ_RE)
                 if await links.count() > 0:
                     return fr, links
                 
-                # 2. Sucesso: Tabela de Resultados (fallback)
                 rows = fr.locator("tr").filter(has_text=CNJ_RE)
                 if await rows.count() > 0:
                     return fr, rows
                 
-                # 3. Aviso: Mensagem de erro ou "Nenhum registro"
                 msg_el = fr.locator(".ui-messages-error, .ui-messages-info, .ui-messages-warn")
                 if await msg_el.count() > 0:
                     txt = await msg_el.first.inner_text()
                     if "encontrado" in txt.lower() or "registro" in txt.lower():
-                        return fr, None # Encontrou aviso de que não tem nada
+                        return fr, None 
             except:
                 continue
         
@@ -241,40 +192,74 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
         )
         
         try:
+            # 1. Abre a URL
             page = await context.new_page()
             await page.goto(URL, wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_timeout(2000)
 
+            # Localiza o frame onde estão os inputs
             fr, doc_input = await find_input_any_frame(page)
             if not doc_input:
                 raise Exception("Input de CPF/CNPJ não encontrado.")
 
-            # 1. Troca o Radio Button
-            print(f"Selecionando tipo {doc_type}...")
-            await force_set_doc_type_radio(page, fr, doc_type)
-            await page.wait_for_timeout(1500)
-            
-            fr, doc_input = await find_input_any_frame(page)
-            
-            # 2. Digita
-            print(f"Digitando documento {doc_digits}...")
-            match = await ensure_input_match(page, doc_input, doc_digits)
-            
-            if not match:
-                print("Injeção falhou. Tentando Toggle...")
-                other_type = "CPF" if doc_type == "CNPJ" else "CNPJ"
-                await force_set_doc_type_radio(page, fr, other_type)
-                await page.wait_for_timeout(1000)
-                await force_set_doc_type_radio(page, fr, doc_type)
-                await page.wait_for_timeout(2000)
-                
-                fr, doc_input = await find_input_any_frame(page)
-                match = await ensure_input_match(page, doc_input, doc_digits)
+            # 2. e 3. Verifica Tipo e Clica no Radio Button Correto (CORRIGIDO PARA 4 RADIOS)
+            # Ordem visual: [0] Numeração, [1] Livre, [2] CPF, [3] CNPJ
+            if doc_type == "CNPJ":
+                radio_index = 3  # Quarto botão
+            else:
+                radio_index = 2  # Terceiro botão (CPF)
 
-            if not match:
-                result["aviso_site"] = f"Não foi possível digitar o documento completo ({len(doc_digits)} dígitos)."
+            print(f"Tipo: {doc_type}. Clicando no Radio Index: {radio_index}")
             
-            # 3. Pesquisar
+            success = await select_radio_by_index(page, fr, radio_index)
+            if not success:
+                # Tenta fallback na página principal se falhar no frame
+                await select_radio_by_index(page, page, radio_index)
+
+            # 4. Espera OBRIGATÓRIA de 5 segundos
+            print("Aguardando 5 segundos para troca de máscara...")
+            await page.wait_for_timeout(5000)
+            
+            # Recarrega input (o DOM pode ter mudado)
+            fr, doc_input = await find_input_any_frame(page)
+            if not doc_input:
+                 raise Exception("Campo de texto perdido após troca de tipo.")
+
+            # 5. Preenche o número
+            print(f"Preenchendo {doc_digits}...")
+            await doc_input.click()
+            
+            # Limpeza reforçada
+            await doc_input.press("Control+A")
+            await doc_input.press("Backspace")
+            await page.wait_for_timeout(500)
+            
+            await doc_input.type(doc_digits, delay=100) 
+            
+            # Sai do campo para acionar validação
+            await page.keyboard.press("Tab")
+            await page.wait_for_timeout(1000)
+
+            # 6. Confere os dígitos
+            raw_val = await doc_input.input_value()
+            clean_val = re.sub(r"\D+", "", raw_val)
+            print(f"Valor lido no campo: {clean_val}")
+
+            # Se for CNPJ e não tiver 14 dígitos, tenta corrigir na força bruta
+            if doc_type == "CNPJ" and len(clean_val) != 14:
+                print("ERRO: Valor incorreto/cortado. Tentando injeção JS...")
+                await doc_input.evaluate(f"el => el.value = '{doc_digits}'")
+                await doc_input.dispatch_event("input")
+                await doc_input.dispatch_event("change")
+                await page.wait_for_timeout(1000)
+                
+                # Re-confere
+                raw_val = await doc_input.input_value()
+                clean_val = re.sub(r"\D+", "", raw_val)
+                if len(clean_val) != 14:
+                     result["aviso_site"] = f"Falha crítica: O campo permaneceu com {len(clean_val)} dígitos após tentativas."
+
+            # 7. Clica em Pesquisar
             print("Clicando em Pesquisar...")
             btn = fr.locator("button:has-text('PESQUISAR'), input[type='submit'][value*='PESQUISAR' i]").first
             if await btn.count() == 0:
@@ -285,26 +270,21 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
             else:
                 await doc_input.press("Enter")
             
-            # 4. Aguarda e Captura Resultados
+            # 8. Retorna Resultados
             print("Aguardando resultados...")
             res_frame, links = await wait_and_find_results(page)
             
             if not links or await links.count() == 0:
-                # Procura aviso final
                 msg = await page.locator(".ui-messages-error, .ui-messages-info").all_inner_texts()
                 if not msg and res_frame:
                     msg = await res_frame.locator(".ui-messages-error, .ui-messages-info").all_inner_texts()
                 
                 if msg: 
                     result["aviso_site"] = msg
-                    print(f"Aviso do site encontrado: {msg}")
-                else:
-                    print("Timeout: Nenhum resultado ou aviso encontrado.")
                 
                 return result
 
             count = await links.count()
-            print(f"Encontrados {count} processos.")
             seen = set()
             
             for i in range(count):
