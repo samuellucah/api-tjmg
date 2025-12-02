@@ -169,11 +169,9 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
         try:
             print(f"Acessando TJMG para {doc_type} {doc_digits}...")
             await page.goto(URL, wait_until="domcontentloaded")
-            await wait_loading(page)
+            await wait_pje_loading(page)
 
             # === 1. SELEÇÃO DO TIPO ===
-            # No TJMG, clicar no radio às vezes recarrega o form. 
-            # Vamos tentar clicar e esperar.
             try:
                 if doc_type.upper() == "CNPJ":
                     await page.locator("input[type='radio'][value='CNPJ'], label:has-text('CNPJ')").first.click()
@@ -181,15 +179,15 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
                     await page.locator("input[type='radio'][value='CPF'], label:has-text('CPF')").first.click()
                 await page.wait_for_timeout(1000)
             except: 
-                print("Erro ao clicar no radio (pode já estar selecionado)")
+                print("Erro ao clicar no radio")
 
-            # === 2. LOCALIZAR O INPUT E O FRAME CORRETO ===
+            # === 2. LOCALIZAR INPUT ===
             fr, target_input = await find_input_any_frame(page)
 
             if not target_input:
-                # Fallback: tenta buscar diretamente pelo label
+                # Fallback
                 target_input = page.locator("td:has-text('CPF'), td:has-text('CNPJ')").locator("xpath=..//input").first
-                fr = page # Assume frame principal no fallback
+                fr = page
 
             if not target_input:
                 raise HTTPException(status_code=500, detail="input_nao_encontrado")
@@ -199,19 +197,9 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
             await target_input.fill("")
             await target_input.type(doc_digits, delay=50)
             
-            # === 4. CLICAR NO BOTÃO (CORREÇÃO DO ERRO 500) ===
-            # O pulo do gato: Temos que buscar o botão DENTRO do mesmo frame (fr) do input
-            # Se usarmos page.locator, ele não acha se estiver num iframe.
-            
+            # === 4. CLICAR PESQUISAR ===
             search_context = fr if fr else page
-            
-            # Lista de seletores possíveis para o botão pesquisar
-            btn_selectors = [
-                "input[value='PESQUISAR']", 
-                "button:has-text('PESQUISAR')", 
-                "a:has-text('PESQUISAR')",
-                "input[type='submit']"
-            ]
+            btn_selectors = ["input[value='PESQUISAR']", "button:has-text('PESQUISAR')", "a:has-text('PESQUISAR')", "input[type='submit']"]
             
             btn = None
             for sel in btn_selectors:
@@ -221,20 +209,16 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
                     break
             
             if not btn:
-                # Se não achou no frame, tenta na página principal (vai que...)
                 btn = page.get_by_role("button", name="PESQUISAR").first
             
             await btn.click()
+            await wait_pje_loading(page)
             
-            # Espera resultado
-            await wait_loading(page)
-            
-            # Espera tabela ou erro
             try:
                 await page.wait_for_selector("a.btn-detalhes, a[href*='Processo'], .rich-messages", timeout=8000)
             except: pass
 
-            # === 5. EXTRAIR DADOS ===
+            # === 5. EXTRAIR ===
             links = page.locator("a").filter(has_text=CNJ_RE)
             count = await links.count()
             print(f"Links encontrados: {count}")
@@ -249,7 +233,6 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
                 
                 numero = m.group(0)
                 
-                # Tenta clicar no ícone
                 clickable = link
                 try:
                     row = link.locator("xpath=./ancestor::tr").first
@@ -269,4 +252,9 @@ async def scrape_pje(doc_digits: str, doc_type: str) -> Dict[str, Any]:
                 await popup.close()
 
         except Exception as e:
-            await browser.
+            print(f"Erro geral: {e}")
+            await browser.close()
+            raise HTTPException(status_code=500, detail=str(e))
+
+        await browser.close()
+    return result    
